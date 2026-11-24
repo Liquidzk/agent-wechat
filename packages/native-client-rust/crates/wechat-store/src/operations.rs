@@ -5,6 +5,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[path = "logout.rs"]
 mod logout;
 
+fn prepare_runtime_prefix<'db>(
+    db: &'db Connection,
+    prefix: &str,
+) -> rusqlite::Result<rusqlite::Statement<'db>> {
+    let sql = match prefix {
+        "received-media:" | "received-voice:" => include_str!("received_queue.sql"),
+        _ => {
+            "SELECT key,value FROM runtime WHERE substr(key,1,length(?1))=?1 ORDER BY key LIMIT ?2"
+        }
+    };
+    db.prepare(sql)
+}
+
 pub(crate) fn migrate(db: &mut Connection) -> Result<()> {
     let tx = db.transaction()?;
     tx.execute_batch(include_str!(
@@ -413,8 +426,10 @@ impl Store {
             "invalid_runtime_query"
         );
         self.control(account, |db| {
-            let mut query = db.prepare("SELECT key,value FROM runtime WHERE substr(key,1,length(?1))=?1 ORDER BY key LIMIT ?2")?;
-            let rows = query.query_map(params![prefix, limit as i64], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            let mut query = prepare_runtime_prefix(db, prefix)?;
+            let rows = query.query_map(params![prefix, limit as i64], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
             Ok(rows.collect::<rusqlite::Result<_>>()?)
         })
     }
@@ -1262,6 +1277,73 @@ mod tests {
 #[cfg(test)]
 mod runtime_prefix_tests {
     use super::*;
+
+    #[test]
+    fn received_queue_reads_have_bounded_work_and_keep_payload_order() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(&temporary.path().join("data")).unwrap();
+        store.create_account("one").unwrap();
+        store
+            .control("one", |db| {
+                db.execute_batch(
+                    "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<8192)
+                 INSERT INTO runtime(key,value) SELECT printf('other:%05d',i), X'00' FROM n",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let prefixes = ["received-media:", "received-voice:"];
+        for stem in ["received-media", "received-voice"] {
+            for neighbor in ["9", ";", ";extra"] {
+                store
+                    .put_runtime("one", &format!("{stem}{neighbor}"), b"unrelated")
+                    .unwrap();
+            }
+        }
+
+        for populated in [false, true] {
+            if populated {
+                for prefix in prefixes {
+                    for (suffix, payload) in [("z", 9u8), ("中", 10), ("%", 2), ("", 1), ("_", 3)]
+                    {
+                        store
+                            .put_runtime("one", &format!("{prefix}{suffix}"), &[payload])
+                            .unwrap();
+                    }
+                }
+            }
+            for prefix in prefixes {
+                let rows = store.runtime_prefix("one", prefix, 4).unwrap();
+                // Measure the worker's actual prepared statement on a regular
+                // account connection. No wall-clock budget or WAL snapshot needed.
+                store
+                    .control("one", |db| {
+                        let mut stmt = prepare_runtime_prefix(db, prefix)?;
+                        let mut cursor = stmt.query(params![prefix, 4])?;
+                        while cursor.next()?.is_some() {}
+                        drop(cursor);
+                        let steps = stmt.get_status(rusqlite::StatementStatus::VmStep);
+                        assert!(steps < 1000, "{prefix} required {steps} SQLite steps");
+                        Ok(())
+                    })
+                    .unwrap();
+                if populated {
+                    assert_eq!(
+                        rows,
+                        vec![
+                            (prefix.to_owned(), vec![1]),
+                            (format!("{prefix}%"), vec![2]),
+                            (format!("{prefix}_"), vec![3]),
+                            (format!("{prefix}z"), vec![9]),
+                        ]
+                    );
+                } else {
+                    assert!(rows.is_empty());
+                }
+            }
+        }
+    }
+
     #[test]
     fn read_version_batch_matches_individual_reads_and_keeps_accounts_separate() {
         let temporary = tempfile::tempdir().unwrap();
